@@ -59,6 +59,7 @@ class W8A8Int8Config(QuantizationConfig):
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
+        self.gmm_quant_mode = "W8A8"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:

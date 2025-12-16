@@ -22,15 +22,21 @@ import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
+import torch.distributed as dist
 from torch import nn
+import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+    get_tp_group,
+    get_moe_ep_group,
+    get_moe_tp_group,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -50,6 +56,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.npu_fused_moe_gmm import FusedMoEGMM
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -74,6 +81,8 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     is_npu,
 )
+
+import torch_npu
 
 _is_cuda = is_cuda()
 
@@ -204,6 +213,287 @@ def compute_yarn_parameters(
     # # )
     # # return inv_freq, attention_factor
     return factor, low, high, attention_factor
+
+
+class MoEGate(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+        # topk selection algorithm
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(
+            torch.empty((self.num_experts, self.gating_dim))
+        )
+
+    def forward_greedy(self, logits):
+        topk_weight, topk_idx, row_idx = torch_npu.npu_moe_gating_top_k_softmax(logits, None, k=self.top_k)
+        return topk_idx, topk_weight, row_idx
+
+    def forward(self, hidden_states):
+        logits = F.linear(
+            hidden_states, self.weight, None
+        )
+        topk_idx, topk_weight, row_idx = self.forward_greedy(logits)
+
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        aux_loss = None
+        return topk_idx, topk_weight, aux_loss, row_idx
+
+
+class Qwen3MoeSparseMoeBlockNPU(nn.Module):
+    def __init__(
+        self,
+        layer_id: int,
+        config: Qwen3MoeConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.config = config
+        self.gmm_quant_mode = quant_config.gmm_quant_mode
+        self.hidden_dim = config.hidden_size
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.moe_tp_size = get_moe_tensor_parallel_world_size()
+        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        self.moe_intermediate_size = config.moe_intermediate_size
+        self.intermediate_size_per_rank = self.moe_intermediate_size // self.moe_tp_size
+        self.experts_per_rank = config.num_experts // self.moe_ep_size
+        self.perfect_eplb = False
+        self.experts = FusedMoEGMM(
+            num_experts=config.num_experts
+            + get_global_server_args().ep_num_redundant_experts,
+            top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            quant_config=quant_config,
+            prefix=add_prefix("experts", prefix),
+        )
+        self.gate = MoEGate(config)
+
+    def set_mc2_kwargs(self):
+        moe_ep_group = get_moe_ep_group()
+        moe_ep_group_name = moe_ep_group.comm_name
+        global_rank = moe_ep_group.rank
+        self.dispatch_kwargs = {
+                "x_active_mask": None,
+                "moe_expert_num": self.num_experts,
+                "global_bs": 0,
+                "scales": self.experts.smooth_scale_1 if self.gmm_quant_mode == "W8A8" else None,
+                "group_ep": moe_ep_group_name,
+                "ep_world_size": self.moe_ep_size,
+                "ep_rank_id": global_rank // self.moe_tp_size,
+                "group_tp": moe_ep_group_name,
+                "tp_world_size": self.moe_tp_size,
+                "tp_rank_id": global_rank % self.moe_tp_size,
+                "expert_shard_type": 0,
+                "shared_expert_num": 0,
+                "shared_expert_rank_num": 0,
+                "quant_mode": 2 if self.gmm_quant_mode == "W8A8" else 0,
+            }
+        self.combine_kwargs = {
+                "x_active_mask": None,
+                "moe_expert_num": self.num_experts,
+                "global_bs": 0,
+                "group_ep": moe_ep_group_name,
+                "ep_world_size": self.moe_ep_size,
+                "ep_rank_id": global_rank // self.moe_tp_size,
+                "group_tp": moe_ep_group_name,
+                "tp_world_size": self.moe_tp_size,
+                "tp_rank_id": global_rank % self.moe_tp_size,
+                "expert_shard_type": 0,
+                "shared_expert_num": 0,
+                "shared_expert_rank_num": 0,
+                "comm_quant_mode": 0
+            }
+
+    def forward(self, hidden_states, forward_batch, cur_topk_list=None):
+        if hidden_states.shape[0] > 0:
+            topk_idx, topk_weight, _, row_idx = self.gate(hidden_states)
+            if self.perfect_eplb:
+                topk_idx = cur_topk_list
+            topk_idx = topk_idx.to(torch.int32)
+            if self.moe_tp_size > 1:
+                # MoE TP scene
+                return self.moe_infer_tp(hidden_states, forward_batch, topk_idx, topk_weight)
+            else:
+                # MoE EP scene
+                # TODO: MTP的状态可能由区别，需要额外适配
+                if forward_batch.forward_mode.is_extend() or forward_batch.is_extend_in_batch:
+                    return self.moe_infer_double_routing(hidden_states, forward_batch, topk_idx, topk_weight)
+                else:
+                    return self.moe_infer_dispatch_combine(hidden_states, forward_batch, topk_idx, topk_weight)
+        else:
+            return hidden_states
+
+    def moe_infer_tp(self, hidden_states, forward_batch, topk_idx, topk_weight):
+        total_len, h = hidden_states.shape
+        routing_args = {
+            "expert_idx": topk_idx,
+            "active_num": total_len * self.top_k,
+            "expert_num": self.num_experts,
+            "expert_tokens_num_type": 1,  # 0: cumsum mode(not supported now); 1: count mode
+            "expert_tokens_num_flag": True,
+            "active_expert_range": [0, self.num_experts],
+            "quant_mode": -1
+        }
+        if self.gmm_quant_mode == "W8A8":
+            routing_args.update({
+                "scale": self.experts.smooth_scale_1,
+                "expert_tokens_num_type": 2,
+                "quant_mode": 1,
+                "row_idx_type": 0,
+                "drop_pad_mode": 0
+            })
+
+        expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
+            hidden_states, **routing_args
+        )
+
+        moe_args = {"group_list_type": 1}
+        if self.gmm_quant_mode == "W8A8":
+            moe_args.update({
+                "group_list_type": 2,
+                "pertoken_scale": pertoken_scale
+            })
+        hidden_states_ordered_by_experts = self.experts(expanded_x, tokens_per_expert, **moe_args)
+
+        hidden_states = torch_npu.npu_moe_finalize_routing(
+            hidden_states_ordered_by_experts,
+            skip1=None, skip2=None,
+            bias=None,
+            scales=topk_weight.to(hidden_states_ordered_by_experts.dtype),
+            expanded_src_to_dst_row=expanded_row_idx,
+            export_for_source_row=None, drop_pad_mode=2
+        )
+        if self.moe_tp_size > 1:
+            moe_tp_group = get_moe_tp_group().device_group
+            dist.all_reduce(hidden_states, group=moe_tp_group)
+
+        y = hidden_states.view(-1, self.hidden_dim)
+        return y
+
+
+    def dispatch_double_routing(self, tokens_per_expert, expanded_x, pertoken_scale):
+        moe_ep_group = get_moe_ep_group().device_group
+        tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
+        # (total_experts,)->(total_ranks*n_routed_experts_per_rank)
+        dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=moe_ep_group)
+        # combine tensors, do reduceSum and D2H togather
+        combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
+        # view: EP, E // EP
+        # sum: EP, 每个rank
+        combine_tokens = combine_tokens.view(2, self.moe_ep_size, -1).sum(2)
+        all_tokens = combine_tokens[0].sum()
+        combine_tokens_cpu = combine_tokens.cpu().tolist()
+        # alltoall input splits, 大小为当前rank路由到其他rank的tokens数总和
+        input_splits = combine_tokens_cpu[1]
+        # alltoall output splits, 每个rank拿到的其他rank的tokens数
+        output_splits = combine_tokens_cpu[0]
+        # alltoall output, 展开成一维，大小为其他卡路由到当前rank的tokens数总和
+        gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
+        dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits, group=moe_ep_group)
+        gathered_pertoken_scale = None if pertoken_scale is None else\
+                            pertoken_scale.new_empty(gathered_tokens.shape[0])
+        if self.gmm_quant_mode == "W8A8":
+            dist.all_to_all_single(gathered_pertoken_scale,\
+                                   pertoken_scale, output_splits, input_splits, group=moe_ep_group)
+        return tokens_per_expert_group, gathered_tokens, input_splits, output_splits, gathered_pertoken_scale
+
+    def moe_infer_double_routing(self, hidden_states, forward_batch, topk_ids, topk_weight):
+        bs_qlen, h = hidden_states.shape
+        expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
+            hidden_states,
+            expert_idx=topk_ids,
+            active_num=topk_ids.shape[0] * topk_ids.shape[1],
+            scale=self.experts.smooth_scale_1 if self.gmm_quant_mode == "W8A8" else None,
+            expert_num=self.num_experts,
+            expert_tokens_num_type=1,  # 0: cumsum mode(not supported now); 1: count mode
+            expert_tokens_num_flag=True, active_expert_range=[0, self.num_experts],
+            quant_mode=1 if self.gmm_quant_mode == "W8A8" else -1
+            # -1: non-quant; 1: dynamic quant; 0: static quant(not supported now)
+        )
+        moe_ep_group = get_moe_ep_group().device_group
+        tokens_per_expert_group, gathered_tokens, input_splits, output_splits, gathered_pertoken_scale =\
+            self.dispatch_double_routing(tokens_per_expert, expanded_x, pertoken_scale)
+
+        # reroute
+        hidden_states_ordered_by_experts, gathered_pertoken_scale, gathered_ids_unsort, tokens_per_local_expert = \
+            torch_npu.npu_moe_re_routing(gathered_tokens, tokens_per_expert_group.view(self.moe_ep_size, -1),
+            per_token_scales=gathered_pertoken_scale)
+
+        # compute experts
+        gmm_args = {
+            "x": hidden_states_ordered_by_experts,
+            "expert_tokens": tokens_per_local_expert,
+            "group_list_type": 1,
+        }
+        if self.gmm_quant_mode == "W8A8":
+            gmm_args.update({"pertoken_scale": gathered_pertoken_scale})
+        hidden_states_ordered_by_experts = self.experts(**gmm_args)
+        # finalize-rerouting
+        new_x = torch.index_select(hidden_states_ordered_by_experts, 0, gathered_ids_unsort.float().argsort().int())
+        gathered_tokens = new_x.new_empty(*expanded_x.shape)
+        dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits, group=moe_ep_group)
+
+        # finalize-routing
+        hidden_states = torch_npu.npu_moe_finalize_routing(
+            gathered_tokens, skip1=None, skip2=None, bias=None,
+            scales=topk_weight.to(gathered_tokens.dtype),
+            expanded_src_to_dst_row=expanded_row_idx,
+            export_for_source_row=None, drop_pad_mode=2
+        )
+        hidden_states = hidden_states.view(bs_qlen, self.hidden_dim)
+        return hidden_states
+
+    def moe_infer_dispatch_combine(self, x, forward_batch, topk_ids, topk_weight):
+        """
+        support ep for decode stage
+        """
+        self.set_mc2_kwargs()
+
+        # moe dispatch
+        dispatch_args = {
+            "x": x,
+            "expert_ids": topk_ids, # [n*topk]
+            **self.dispatch_kwargs
+        }
+        output = torch_npu.npu_moe_distribute_dispatch_v2(**dispatch_args)
+        expand_x, dynamic_scale, expand_idx, expert_token_num, ep_recv_counts, tp_recv_counts = output[:6]
+
+        # compute experts
+        gmm_args = {
+            "x": expand_x,
+            "expert_tokens": expert_token_num,
+            "group_list_type": 1,
+        }
+        if self.gmm_quant_mode == "W8A8":
+            gmm_args.update({"pertoken_scale": dynamic_scale})
+
+        hidden_states_ordered_by_experts = self.experts(**gmm_args)
+
+        # moe combine
+        combine_args = {
+            "expand_x": hidden_states_ordered_by_experts,
+            "expert_ids": topk_ids,
+            "assist_info_for_combine": expand_idx,
+            "expert_scales": topk_weight.to(torch.float32), # [n*topk]
+            "ep_send_counts": ep_recv_counts,
+            "tp_send_counts": tp_recv_counts,
+            **self.combine_kwargs
+        }
+        hidden_states = torch_npu.npu_moe_distribute_combine_v2(**combine_args)
+
+        hidden_states = hidden_states.view(-1, self.hidden_dim)
+        return hidden_states
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -739,7 +1029,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Qwen3MoeSparseMoeBlock(
+            self.mlp = Qwen3MoeSparseMoeBlockNPU(
                 layer_id=self.layer_id,
                 config=config,
                 quant_config=quant_config,
@@ -807,7 +1097,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+            hidden_states, forward_batch
         )
 
         if should_allreduce_fusion:
